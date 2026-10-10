@@ -3,7 +3,8 @@ const corsHeaders = {
   "Access-Control-Allow-Origin": "https://hakima659.github.io",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, X-Admin-Token",
-  "Content-Type": "application/json; charset=utf-8"
+  "Content-Type": "application/json; charset=utf-8",
+  "Cache-Control": "no-store"
 };
 
 function response(data, status = 200) {
@@ -17,6 +18,15 @@ function makeId() {
   return crypto.randomUUID();
 }
 
+function validOrderId(id) {
+  return /^[a-f0-9-]{36}$/i.test(id);
+}
+
+function isAdmin(request, env) {
+  const token = request.headers.get("X-Admin-Token");
+  return Boolean(env.ADMIN_TOKEN && token && token === env.ADMIN_TOKEN);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -24,29 +34,56 @@ export default {
     const method = request.method;
 
     if (method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
-    }
-
-    if (method === "GET" && path === "/health") {
-      return response({
-        ok: true,
-        service: "kalano-api",
-        message: "بک‌اند کالانو فعال است"
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders
       });
     }
 
-    if (method === "GET" && path === "/api/payment-info") {
-      return response({
-        ok: true,
-        cardHolder: env.CARD_HOLDER || "",
-        cardNumber: env.CARD_NUMBER || "",
-        configured: Boolean(env.CARD_HOLDER && env.CARD_NUMBER)
-      });
-    }
+    try {
+      // بررسی فعال بودن API
+      if (method === "GET" && path === "/health") {
+        return response({
+          ok: true,
+          service: "kalano-api",
+          message: "بک‌اند کالانو فعال است"
+        });
+      }
 
-    if (method === "POST" && path === "/api/orders") {
-      try {
-        const body = await request.json();
+      // اطلاعات کارت جهت نمایش به مشتری
+      if (method === "GET" && path === "/api/payment-info") {
+        const configured = Boolean(
+          env.CARD_HOLDER && env.CARD_NUMBER
+        );
+
+        return response({
+          ok: true,
+          cardHolder: env.CARD_HOLDER || "",
+          cardNumber: env.CARD_NUMBER || "",
+          configured
+        });
+      }
+
+      // ثبت سفارش
+      if (method === "POST" && path === "/api/orders") {
+        if (!env.DB) {
+          return response({
+            ok: false,
+            error: "پایگاه داده تنظیم نشده است"
+          }, 500);
+        }
+
+        let body;
+
+        try {
+          body = await request.json();
+        } catch {
+          return response({
+            ok: false,
+            error: "اطلاعات ارسالی معتبر نیست"
+          }, 400);
+        }
+
         const name = String(body.name || "").trim();
         const phone = String(body.phone || "").trim();
         const address = String(body.address || "").trim();
@@ -54,17 +91,43 @@ export default {
         const items = body.items;
         const total = Number(body.total);
 
-        if (!name || !phone || !address) {
+        if (
+          !name || name.length > 120 ||
+          !phone || phone.length > 30 ||
+          !address || address.length > 1000 ||
+          postalCode.length > 30
+        ) {
           return response({
             ok: false,
-            error: "نام، تلفن و نشانی الزامی است"
+            error: "نام، تلفن یا نشانی نامعتبر است"
           }, 400);
         }
 
-        if (!Array.isArray(items) || items.length === 0) {
+        if (
+          !Array.isArray(items) ||
+          items.length === 0 ||
+          items.length > 50
+        ) {
           return response({
             ok: false,
-            error: "سبد خرید خالی است"
+            error: "سبد خرید معتبر نیست"
+          }, 400);
+        }
+
+        const validItems = items.every(item =>
+          item &&
+          typeof item.name === "string" &&
+          item.name.trim().length > 0 &&
+          item.name.length <= 200 &&
+          Number.isSafeInteger(Number(item.quantity)) &&
+          Number(item.quantity) >= 1 &&
+          Number(item.quantity) <= 100
+        );
+
+        if (!validItems) {
+          return response({
+            ok: false,
+            error: "اقلام سفارش معتبر نیستند"
           }, 400);
         }
 
@@ -79,29 +142,25 @@ export default {
           }, 400);
         }
 
-        if (
-          items.length > 50 ||
-          items.some(item =>
-            !item ||
-            typeof item.name !== "string" ||
-            !Number.isSafeInteger(Number(item.quantity)) ||
-            Number(item.quantity) < 1 ||
-            Number(item.quantity) > 100
-          )
-        ) {
-          return response({
-            ok: false,
-            error: "اقلام سفارش معتبر نیستند"
-          }, 400);
-        }
-
+        // هشدار: مبلغ هنوز با قیمت قطعی محصولات در سرور
+        // تطبیق داده نمی‌شود. قبل از فروش واقعی باید این
+        // بررسی با فهرست قیمت معتبر سرور اضافه شود.
         const id = makeId();
         const createdAt = new Date().toISOString();
 
         await env.DB.prepare(`
-          INSERT INTO orders
-          (id, customer_name, phone, address, postal_code,
-           items_json, total, payment_reference, status, created_at)
+          INSERT INTO orders (
+            id,
+            customer_name,
+            phone,
+            address,
+            postal_code,
+            items_json,
+            total,
+            payment_reference,
+            status,
+            created_at
+          )
           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'awaiting_payment', ?)
         `).bind(
           id,
@@ -120,23 +179,33 @@ export default {
           status: "awaiting_payment",
           message: "سفارش ثبت شد؛ پس از پرداخت، کد پیگیری را ارسال کنید"
         }, 201);
-      } catch (error) {
-        return response({
-          ok: false,
-          error: "ثبت سفارش انجام نشد؛ تنظیمات پایگاه داده را بررسی کنید"
-        }, 500);
       }
-    }
 
-    const paymentMatch = path.match(
-      /^\/api\/orders\/([a-f0-9-]+)\/payment-reference$/i
-    );
+      // ثبت کد پیگیری پرداخت
+      const paymentMatch = path.match(
+        /^\/api\/orders\/([a-f0-9-]{36})\/payment-reference$/i
+      );
 
-    if (method === "POST" && paymentMatch) {
-      try {
-        const body = await request.json();
+      if (method === "POST" && paymentMatch) {
+        if (!env.DB) {
+          return response({
+            ok: false,
+            error: "پایگاه داده تنظیم نشده است"
+          }, 500);
+        }
+
+        let body;
+
+        try {
+          body = await request.json();
+        } catch {
+          return response({
+            ok: false,
+            error: "اطلاعات ارسالی معتبر نیست"
+          }, 400);
+        }
+
         const reference = String(body.reference || "").trim();
-        const orderId = paymentMatch[1];
 
         if (reference.length < 3 || reference.length > 100) {
           return response({
@@ -147,9 +216,11 @@ export default {
 
         const result = await env.DB.prepare(`
           UPDATE orders
-          SET payment_reference = ?, status = 'payment_reported'
-          WHERE id = ? AND status = 'awaiting_payment'
-        `).bind(reference, orderId).run();
+          SET payment_reference = ?,
+              status = 'payment_reported'
+          WHERE id = ?
+            AND status = 'awaiting_payment'
+        `).bind(reference, paymentMatch[1]).run();
 
         if (!result.meta.changes) {
           return response({
@@ -163,70 +234,125 @@ export default {
           status: "payment_reported",
           message: "گزارش پرداخت ثبت شد؛ بررسی نهایی دستی است"
         });
-      } catch (error) {
+      }
+
+      // دریافت سفارش‌ها برای مدیر
+      if (method === "GET" && path === "/api/admin/orders") {
+        if (!isAdmin(request, env)) {
+          return response({
+            ok: false,
+            error: "دسترسی غیرمجاز"
+          }, 401);
+        }
+
+        if (!env.DB) {
+          return response({
+            ok: false,
+            error: "پایگاه داده تنظیم نشده است"
+          }, 500);
+        }
+
+        const result = await env.DB.prepare(`
+          SELECT
+            id,
+            customer_name,
+            phone,
+            address,
+            postal_code,
+            items_json,
+            total,
+            payment_reference,
+            status,
+            created_at
+          FROM orders
+          ORDER BY created_at DESC
+          LIMIT 100
+        `).all();
+
         return response({
-          ok: false,
-          error: "ثبت کد پیگیری ناموفق بود"
-        }, 500);
+          ok: true,
+          orders: result.results
+        });
       }
+
+      // تغییر وضعیت سفارش توسط مدیر
+      const statusMatch = path.match(
+        /^\/api\/admin\/orders\/([a-f0-9-]{36})\/status$/i
+      );
+
+      if (method === "POST" && statusMatch) {
+        if (!isAdmin(request, env)) {
+          return response({
+            ok: false,
+            error: "دسترسی غیرمجاز"
+          }, 401);
+        }
+
+        if (!env.DB) {
+          return response({
+            ok: false,
+            error: "پایگاه داده تنظیم نشده است"
+          }, 500);
+        }
+
+        let body;
+
+        try {
+          body = await request.json();
+        } catch {
+          return response({
+            ok: false,
+            error: "اطلاعات ارسالی معتبر نیست"
+          }, 400);
+        }
+
+        const allowed = [
+          "awaiting_payment",
+          "payment_reported",
+          "paid",
+          "processing",
+          "shipped",
+          "cancelled"
+        ];
+
+        const status = String(body.status || "");
+
+        if (!allowed.includes(status)) {
+          return response({
+            ok: false,
+            error: "وضعیت نامعتبر است"
+          }, 400);
+        }
+
+        const result = await env.DB.prepare(`
+          UPDATE orders
+          SET status = ?
+          WHERE id = ?
+        `).bind(status, statusMatch[1]).run();
+
+        if (!result.meta.changes) {
+          return response({
+            ok: false,
+            error: "سفارش پیدا نشد"
+          }, 404);
+        }
+
+        return response({
+          ok: true,
+          status
+        });
+      }
+
+      return response({
+        ok: false,
+        error: "مسیر پیدا نشد"
+      }, 404);
+
+    } catch (error) {
+      return response({
+        ok: false,
+        error: "خطای داخلی سرور؛ تنظیمات و پایگاه داده را بررسی کنید"
+      }, 500);
     }
-
-    if (method === "GET" && path === "/api/admin/orders") {
-      if (!env.ADMIN_TOKEN ||
-          request.headers.get("X-Admin-Token") !== env.ADMIN_TOKEN) {
-        return response({ ok: false, error: "دسترسی غیرمجاز" }, 401);
-      }
-
-      const result = await env.DB.prepare(`
-        SELECT id, customer_name, phone, address, postal_code,
-               items_json, total, payment_reference, status, created_at
-        FROM orders
-        ORDER BY created_at DESC
-        LIMIT 100
-      `).all();
-
-      return response({ ok: true, orders: result.results });
-    }
-
-    const statusMatch = path.match(
-      /^\/api\/admin\/orders\/([a-f0-9-]+)\/status$/i
-    );
-
-    if (method === "POST" && statusMatch) {
-      if (!env.ADMIN_TOKEN ||
-          request.headers.get("X-Admin-Token") !== env.ADMIN_TOKEN) {
-        return response({ ok: false, error: "دسترسی غیرمجاز" }, 401);
-      }
-
-      const body = await request.json();
-      const allowed = [
-        "awaiting_payment",
-        "payment_reported",
-        "paid",
-        "processing",
-        "shipped",
-        "cancelled"
-      ];
-      const status = String(body.status || "");
-
-      if (!allowed.includes(status)) {
-        return response({ ok: false, error: "وضعیت نامعتبر است" }, 400);
-      }
-
-      const result = await env.DB.prepare(`
-        UPDATE orders SET status = ? WHERE id = ?
-      `).bind(status, statusMatch[1]).run();
-
-      if (!result.meta.changes) {
-        return response({ ok: false, error: "سفارش پیدا نشد" }, 404);
-      }
-
-      return response({ ok: true, status });
-    }
-
-    return response({
-      ok: false,
-      error: "مسیر پیدا نشد"
-    }, 404);
   }
 };
