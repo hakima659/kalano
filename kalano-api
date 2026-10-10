@@ -1,0 +1,232 @@
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "https://hakima659.github.io",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, X-Admin-Token",
+  "Content-Type": "application/json; charset=utf-8"
+};
+
+function response(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: corsHeaders
+  });
+}
+
+function makeId() {
+  return crypto.randomUUID();
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    if (method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    if (method === "GET" && path === "/health") {
+      return response({
+        ok: true,
+        service: "kalano-api",
+        message: "بک‌اند کالانو فعال است"
+      });
+    }
+
+    if (method === "GET" && path === "/api/payment-info") {
+      return response({
+        ok: true,
+        cardHolder: env.CARD_HOLDER || "",
+        cardNumber: env.CARD_NUMBER || "",
+        configured: Boolean(env.CARD_HOLDER && env.CARD_NUMBER)
+      });
+    }
+
+    if (method === "POST" && path === "/api/orders") {
+      try {
+        const body = await request.json();
+        const name = String(body.name || "").trim();
+        const phone = String(body.phone || "").trim();
+        const address = String(body.address || "").trim();
+        const postalCode = String(body.postalCode || "").trim();
+        const items = body.items;
+        const total = Number(body.total);
+
+        if (!name || !phone || !address) {
+          return response({
+            ok: false,
+            error: "نام، تلفن و نشانی الزامی است"
+          }, 400);
+        }
+
+        if (!Array.isArray(items) || items.length === 0) {
+          return response({
+            ok: false,
+            error: "سبد خرید خالی است"
+          }, 400);
+        }
+
+        if (
+          !Number.isSafeInteger(total) ||
+          total <= 0 ||
+          total > 100000000000
+        ) {
+          return response({
+            ok: false,
+            error: "مبلغ سفارش معتبر نیست"
+          }, 400);
+        }
+
+        if (
+          items.length > 50 ||
+          items.some(item =>
+            !item ||
+            typeof item.name !== "string" ||
+            !Number.isSafeInteger(Number(item.quantity)) ||
+            Number(item.quantity) < 1 ||
+            Number(item.quantity) > 100
+          )
+        ) {
+          return response({
+            ok: false,
+            error: "اقلام سفارش معتبر نیستند"
+          }, 400);
+        }
+
+        const id = makeId();
+        const createdAt = new Date().toISOString();
+
+        await env.DB.prepare(`
+          INSERT INTO orders
+          (id, customer_name, phone, address, postal_code,
+           items_json, total, payment_reference, status, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'awaiting_payment', ?)
+        `).bind(
+          id,
+          name,
+          phone,
+          address,
+          postalCode,
+          JSON.stringify(items),
+          total,
+          createdAt
+        ).run();
+
+        return response({
+          ok: true,
+          orderId: id,
+          status: "awaiting_payment",
+          message: "سفارش ثبت شد؛ پس از پرداخت، کد پیگیری را ارسال کنید"
+        }, 201);
+      } catch (error) {
+        return response({
+          ok: false,
+          error: "ثبت سفارش انجام نشد؛ تنظیمات پایگاه داده را بررسی کنید"
+        }, 500);
+      }
+    }
+
+    const paymentMatch = path.match(
+      /^\/api\/orders\/([a-f0-9-]+)\/payment-reference$/i
+    );
+
+    if (method === "POST" && paymentMatch) {
+      try {
+        const body = await request.json();
+        const reference = String(body.reference || "").trim();
+        const orderId = paymentMatch[1];
+
+        if (reference.length < 3 || reference.length > 100) {
+          return response({
+            ok: false,
+            error: "کد پیگیری معتبر وارد کنید"
+          }, 400);
+        }
+
+        const result = await env.DB.prepare(`
+          UPDATE orders
+          SET payment_reference = ?, status = 'payment_reported'
+          WHERE id = ? AND status = 'awaiting_payment'
+        `).bind(reference, orderId).run();
+
+        if (!result.meta.changes) {
+          return response({
+            ok: false,
+            error: "سفارش پیدا نشد یا قبلاً گزارش پرداخت ثبت شده است"
+          }, 404);
+        }
+
+        return response({
+          ok: true,
+          status: "payment_reported",
+          message: "گزارش پرداخت ثبت شد؛ بررسی نهایی دستی است"
+        });
+      } catch (error) {
+        return response({
+          ok: false,
+          error: "ثبت کد پیگیری ناموفق بود"
+        }, 500);
+      }
+    }
+
+    if (method === "GET" && path === "/api/admin/orders") {
+      if (!env.ADMIN_TOKEN ||
+          request.headers.get("X-Admin-Token") !== env.ADMIN_TOKEN) {
+        return response({ ok: false, error: "دسترسی غیرمجاز" }, 401);
+      }
+
+      const result = await env.DB.prepare(`
+        SELECT id, customer_name, phone, address, postal_code,
+               items_json, total, payment_reference, status, created_at
+        FROM orders
+        ORDER BY created_at DESC
+        LIMIT 100
+      `).all();
+
+      return response({ ok: true, orders: result.results });
+    }
+
+    const statusMatch = path.match(
+      /^\/api\/admin\/orders\/([a-f0-9-]+)\/status$/i
+    );
+
+    if (method === "POST" && statusMatch) {
+      if (!env.ADMIN_TOKEN ||
+          request.headers.get("X-Admin-Token") !== env.ADMIN_TOKEN) {
+        return response({ ok: false, error: "دسترسی غیرمجاز" }, 401);
+      }
+
+      const body = await request.json();
+      const allowed = [
+        "awaiting_payment",
+        "payment_reported",
+        "paid",
+        "processing",
+        "shipped",
+        "cancelled"
+      ];
+      const status = String(body.status || "");
+
+      if (!allowed.includes(status)) {
+        return response({ ok: false, error: "وضعیت نامعتبر است" }, 400);
+      }
+
+      const result = await env.DB.prepare(`
+        UPDATE orders SET status = ? WHERE id = ?
+      `).bind(status, statusMatch[1]).run();
+
+      if (!result.meta.changes) {
+        return response({ ok: false, error: "سفارش پیدا نشد" }, 404);
+      }
+
+      return response({ ok: true, status });
+    }
+
+    return response({
+      ok: false,
+      error: "مسیر پیدا نشد"
+    }, 404);
+  }
+};
