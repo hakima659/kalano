@@ -18,10 +18,6 @@ function makeId() {
   return crypto.randomUUID();
 }
 
-function validOrderId(id) {
-  return /^[a-f0-9-]{36}$/i.test(id);
-}
-
 function isAdmin(request, env) {
   const token = request.headers.get("X-Admin-Token");
   return Boolean(env.ADMIN_TOKEN && token && token === env.ADMIN_TOKEN);
@@ -50,7 +46,7 @@ export default {
         });
       }
 
-      // اطلاعات کارت جهت نمایش به مشتری
+      // اطلاعات کارت پرداخت
       if (method === "GET" && path === "/api/payment-info") {
         const configured = Boolean(
           env.CARD_HOLDER && env.CARD_NUMBER
@@ -142,9 +138,8 @@ export default {
           }, 400);
         }
 
-        // هشدار: مبلغ هنوز با قیمت قطعی محصولات در سرور
-        // تطبیق داده نمی‌شود. قبل از فروش واقعی باید این
-        // بررسی با فهرست قیمت معتبر سرور اضافه شود.
+        // توجه: پیش از فروش واقعی باید مبلغ
+        // با قیمت معتبر محصولات در سمت سرور محاسبه شود.
         const id = makeId();
         const createdAt = new Date().toISOString();
 
