@@ -1,353 +1,226 @@
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "https://hakima659.github.io",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, X-Admin-Token",
-  "Content-Type": "application/json; charset=utf-8",
-  "Cache-Control": "no-store"
-};
+const ALLOWED_ORIGIN = "https://hakima659.github.io";
+const MAX_RECEIPT_CHARS = 450_000;
 
-function response(data, status = 200) {
+function cors(origin) {
+  return {
+    "Access-Control-Allow-Origin":
+      origin === ALLOWED_ORIGIN ? origin : ALLOWED_ORIGIN,
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers":
+      "Content-Type, X-Admin-Token",
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Vary": "Origin"
+  };
+}
+
+function reply(data, status, origin) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: corsHeaders
+    headers: cors(origin)
   });
+}
+
+async function initDB(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id TEXT PRIMARY KEY,
+      customer_name TEXT NOT NULL,
+      mobile TEXT NOT NULL,
+      description TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      receipt TEXT,
+      created_at TEXT NOT NULL
+    )
+  `).run();
 }
 
 function makeId() {
   return crypto.randomUUID();
 }
 
-function isAdmin(request, env) {
-  const token = request.headers.get("X-Admin-Token");
-  return Boolean(env.ADMIN_TOKEN && token && token === env.ADMIN_TOKEN);
-}
-
 export default {
   async fetch(request, env) {
+    const origin = request.headers.get("Origin") || "";
     const url = new URL(request.url);
-    const path = url.pathname;
-    const method = request.method;
+    const path = url.pathname.replace(/\/+$/, "") || "/";
 
-    if (method === "OPTIONS") {
+    if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
-        headers: corsHeaders
+        headers: cors(origin)
       });
     }
 
+    if (!env.DB) {
+      return reply({ ok: false, error: "DB_NOT_CONFIGURED" }, 500, origin);
+    }
+
     try {
-      // بررسی فعال بودن API
-      if (method === "GET" && path === "/health") {
-        return response({
-          ok: true,
-          service: "kalano-api",
-          message: "بک‌اند کالانو فعال است"
-        });
+      await initDB(env.DB);
+
+      if (path === "/health" && request.method === "GET") {
+        return reply({ ok: true, service: "kalano-api" }, 200, origin);
       }
 
-      // اطلاعات کارت پرداخت
-      if (method === "GET" && path === "/api/payment-info") {
-        const configured = Boolean(
-          env.CARD_HOLDER && env.CARD_NUMBER
-        );
-
-        return response({
+      if (path === "/api/payment-info" && request.method === "GET") {
+        return reply({
           ok: true,
+          method: "card_to_card",
           cardHolder: env.CARD_HOLDER || "",
           cardNumber: env.CARD_NUMBER || "",
-          configured
-        });
+          instructions: "پس از واریز، رسید را برای سفارش ثبت کنید."
+        }, 200, origin);
       }
 
-      // ثبت سفارش
-      if (method === "POST" && path === "/api/orders") {
-        if (!env.DB) {
-          return response({
+      if (path === "/api/orders" && request.method === "POST") {
+        const body = await request.json();
+
+        const customerName = String(body.customerName || "").trim();
+        const mobile = String(body.mobile || "").trim();
+        const description = String(body.description || "").trim();
+        const amount = Number(body.amount);
+
+        if (!customerName || !mobile || !description) {
+          return reply({
             ok: false,
-            error: "پایگاه داده تنظیم نشده است"
-          }, 500);
+            error: "نام، موبایل و شرح سفارش الزامی است."
+          }, 400, origin);
         }
 
-        let body;
-
-        try {
-          body = await request.json();
-        } catch {
-          return response({
-            ok: false,
-            error: "اطلاعات ارسالی معتبر نیست"
-          }, 400);
+        if (!/^[0-9+\-\s()]{8,20}$/.test(mobile)) {
+          return reply({ ok: false, error: "شماره موبایل معتبر نیست." }, 400, origin);
         }
 
-        const name = String(body.name || "").trim();
-        const phone = String(body.phone || "").trim();
-        const address = String(body.address || "").trim();
-        const postalCode = String(body.postalCode || "").trim();
-        const items = body.items;
-        const total = Number(body.total);
-
-        if (
-          !name || name.length > 120 ||
-          !phone || phone.length > 30 ||
-          !address || address.length > 1000 ||
-          postalCode.length > 30
-        ) {
-          return response({
-            ok: false,
-            error: "نام، تلفن یا نشانی نامعتبر است"
-          }, 400);
+        if (!Number.isSafeInteger(amount) || amount <= 0) {
+          return reply({ ok: false, error: "مبلغ سفارش معتبر نیست." }, 400, origin);
         }
 
-        if (
-          !Array.isArray(items) ||
-          items.length === 0 ||
-          items.length > 50
-        ) {
-          return response({
-            ok: false,
-            error: "سبد خرید معتبر نیست"
-          }, 400);
-        }
-
-        const validItems = items.every(item =>
-          item &&
-          typeof item.name === "string" &&
-          item.name.trim().length > 0 &&
-          item.name.length <= 200 &&
-          Number.isSafeInteger(Number(item.quantity)) &&
-          Number(item.quantity) >= 1 &&
-          Number(item.quantity) <= 100
-        );
-
-        if (!validItems) {
-          return response({
-            ok: false,
-            error: "اقلام سفارش معتبر نیستند"
-          }, 400);
-        }
-
-        if (
-          !Number.isSafeInteger(total) ||
-          total <= 0 ||
-          total > 100000000000
-        ) {
-          return response({
-            ok: false,
-            error: "مبلغ سفارش معتبر نیست"
-          }, 400);
-        }
-
-        // توجه: پیش از فروش واقعی باید مبلغ
-        // با قیمت معتبر محصولات در سمت سرور محاسبه شود.
         const id = makeId();
         const createdAt = new Date().toISOString();
 
         await env.DB.prepare(`
-          INSERT INTO orders (
-            id,
-            customer_name,
-            phone,
-            address,
-            postal_code,
-            items_json,
-            total,
-            payment_reference,
-            status,
-            created_at
-          )
-          VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'awaiting_payment', ?)
+          INSERT INTO orders
+          (id, customer_name, mobile, description, amount, status, created_at)
+          VALUES (?, ?, ?, ?, ?, 'pending', ?)
         `).bind(
-          id,
-          name,
-          phone,
-          address,
-          postalCode,
-          JSON.stringify(items),
-          total,
-          createdAt
+          id, customerName, mobile, description, amount, createdAt
         ).run();
 
-        return response({
+        return reply({
           ok: true,
-          orderId: id,
-          status: "awaiting_payment",
-          message: "سفارش ثبت شد؛ پس از پرداخت، کد پیگیری را ارسال کنید"
-        }, 201);
+          order: {
+            id,
+            customerName,
+            mobile,
+            description,
+            amount,
+            status: "pending",
+            createdAt
+          },
+          message: "سفارش ثبت شد. پس از پرداخت، رسید را ارسال کنید."
+        }, 201, origin);
       }
 
-      // ثبت کد پیگیری پرداخت
-      const paymentMatch = path.match(
-        /^\/api\/orders\/([a-f0-9-]{36})\/payment-reference$/i
-      );
+      const receiptMatch = path.match(/^\/api\/orders\/([a-f0-9-]+)\/receipt$/i);
 
-      if (method === "POST" && paymentMatch) {
-        if (!env.DB) {
-          return response({
+      if (receiptMatch && request.method === "POST") {
+        const id = receiptMatch[1];
+        const body = await request.json();
+        const receipt = String(body.receipt || "");
+
+        if (
+          !receipt.startsWith("data:image/") ||
+          !/^data:image\/(jpeg|jpg|png|webp);base64,/i.test(receipt)
+        ) {
+          return reply({
             ok: false,
-            error: "پایگاه داده تنظیم نشده است"
-          }, 500);
+            error: "فقط تصویر JPG، PNG یا WEBP پذیرفته می‌شود."
+          }, 400, origin);
         }
 
-        let body;
-
-        try {
-          body = await request.json();
-        } catch {
-          return response({
+        if (receipt.length > MAX_RECEIPT_CHARS) {
+          return reply({
             ok: false,
-            error: "اطلاعات ارسالی معتبر نیست"
-          }, 400);
-        }
-
-        const reference = String(body.reference || "").trim();
-
-        if (reference.length < 3 || reference.length > 100) {
-          return response({
-            ok: false,
-            error: "کد پیگیری معتبر وارد کنید"
-          }, 400);
+            error: "حجم رسید زیاد است؛ تصویر را کوچک‌تر کنید."
+          }, 413, origin);
         }
 
         const result = await env.DB.prepare(`
           UPDATE orders
-          SET payment_reference = ?,
-              status = 'payment_reported'
-          WHERE id = ?
-            AND status = 'awaiting_payment'
-        `).bind(reference, paymentMatch[1]).run();
+          SET receipt = ?
+          WHERE id = ? AND status = 'pending'
+        `).bind(receipt, id).run();
 
         if (!result.meta.changes) {
-          return response({
+          return reply({
             ok: false,
-            error: "سفارش پیدا نشد یا قبلاً گزارش پرداخت ثبت شده است"
-          }, 404);
+            error: "سفارش پیدا نشد یا دیگر در انتظار بررسی نیست."
+          }, 404, origin);
         }
 
-        return response({
+        return reply({
           ok: true,
-          status: "payment_reported",
-          message: "گزارش پرداخت ثبت شد؛ بررسی نهایی دستی است"
-        });
+          message: "رسید ثبت شد و در انتظار بررسی مدیر است."
+        }, 200, origin);
       }
 
-      // دریافت سفارش‌ها برای مدیر
-      if (method === "GET" && path === "/api/admin/orders") {
-        if (!isAdmin(request, env)) {
-          return response({
-            ok: false,
-            error: "دسترسی غیرمجاز"
-          }, 401);
-        }
-
-        if (!env.DB) {
-          return response({
-            ok: false,
-            error: "پایگاه داده تنظیم نشده است"
-          }, 500);
+      if (path === "/api/admin/orders" && request.method === "GET") {
+        if (
+          !env.ADMIN_TOKEN ||
+          request.headers.get("X-Admin-Token") !== env.ADMIN_TOKEN
+        ) {
+          return reply({ ok: false, error: "UNAUTHORIZED" }, 401, origin);
         }
 
         const result = await env.DB.prepare(`
-          SELECT
-            id,
-            customer_name,
-            phone,
-            address,
-            postal_code,
-            items_json,
-            total,
-            payment_reference,
-            status,
-            created_at
+          SELECT id, customer_name, mobile, description, amount,
+                 status, receipt, created_at
           FROM orders
           ORDER BY created_at DESC
           LIMIT 100
         `).all();
 
-        return response({
-          ok: true,
-          orders: result.results
-        });
+        return reply({ ok: true, orders: result.results }, 200, origin);
       }
 
-      // تغییر وضعیت سفارش توسط مدیر
-      const statusMatch = path.match(
-        /^\/api\/admin\/orders\/([a-f0-9-]{36})\/status$/i
-      );
+      const statusMatch = path.match(/^\/api\/admin\/orders\/([a-f0-9-]+)\/status$/i);
 
-      if (method === "POST" && statusMatch) {
-        if (!isAdmin(request, env)) {
-          return response({
-            ok: false,
-            error: "دسترسی غیرمجاز"
-          }, 401);
+      if (statusMatch && request.method === "POST") {
+        if (
+          !env.ADMIN_TOKEN ||
+          request.headers.get("X-Admin-Token") !== env.ADMIN_TOKEN
+        ) {
+          return reply({ ok: false, error: "UNAUTHORIZED" }, 401, origin);
         }
 
-        if (!env.DB) {
-          return response({
-            ok: false,
-            error: "پایگاه داده تنظیم نشده است"
-          }, 500);
-        }
-
-        let body;
-
-        try {
-          body = await request.json();
-        } catch {
-          return response({
-            ok: false,
-            error: "اطلاعات ارسالی معتبر نیست"
-          }, 400);
-        }
-
-        const allowed = [
-          "awaiting_payment",
-          "payment_reported",
-          "paid",
-          "processing",
-          "shipped",
-          "cancelled"
-        ];
-
+        const body = await request.json();
         const status = String(body.status || "");
+        const allowed = ["pending", "approved", "rejected"];
 
         if (!allowed.includes(status)) {
-          return response({
-            ok: false,
-            error: "وضعیت نامعتبر است"
-          }, 400);
+          return reply({ ok: false, error: "وضعیت نامعتبر است." }, 400, origin);
         }
 
         const result = await env.DB.prepare(`
-          UPDATE orders
-          SET status = ?
-          WHERE id = ?
+          UPDATE orders SET status = ? WHERE id = ?
         `).bind(status, statusMatch[1]).run();
 
         if (!result.meta.changes) {
-          return response({
-            ok: false,
-            error: "سفارش پیدا نشد"
-          }, 404);
+          return reply({ ok: false, error: "سفارش پیدا نشد." }, 404, origin);
         }
 
-        return response({
-          ok: true,
-          status
-        });
+        return reply({ ok: true, message: "وضعیت سفارش به‌روزرسانی شد." }, 200, origin);
       }
 
-      return response({
-        ok: false,
-        error: "مسیر پیدا نشد"
-      }, 404);
-
+      return reply({ ok: false, error: "NOT_FOUND" }, 404, origin);
     } catch (error) {
-      return response({
+      return reply({
         ok: false,
-        error: "خطای داخلی سرور؛ تنظیمات و پایگاه داده را بررسی کنید"
-      }, 500);
+        error: "INTERNAL_ERROR"
+      }, 500, origin);
     }
   }
 };
