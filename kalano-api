@@ -1,451 +1,941 @@
-const ALLOWED_ORIGIN = "https://hakima659.github.io";
 
-const HEADERS = {
-  "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, X-Admin-Token",
-  "Content-Type": "application/json; charset=utf-8",
-  "Cache-Control": "no-store",
-  "Vary": "Origin"
+const ALLOWED_ORIGIN = "https://hakima659.github.io";
+const SESSION_DAYS = 30;
+
+const PLANS = {
+  free: {
+    name: "رایگان",
+    price: 0,
+    limit: 2
+  },
+  bronze: {
+    name: "برنزی",
+    price: 290000,
+    limit: 20
+  },
+  silver: {
+    name: "نقره‌ای",
+    price: 590000,
+    limit: 100
+  },
+  gold: {
+    name: "طلایی",
+    price: 1290000,
+    limit: 10000
+  },
+  diamond: {
+    name: "الماسی",
+    price: 2900000,
+    limit: 10000
+  },
+  special: {
+    name: "ویژه",
+    price: 5900000,
+    limit: 10000
+  }
 };
+
+function headers(origin = "") {
+  return {
+    "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers":
+      "Content-Type, Authorization, X-Admin-Token",
+    "Access-Control-Max-Age": "86400",
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Vary": "Origin"
+  };
+}
 
 function response(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: HEADERS
+    headers: headers()
   });
-}
-
-function isAdmin(request, env) {
-  const token = env.ADMIN_TOKEN;
-  return Boolean(
-    token &&
-    request.headers.get("X-Admin-Token") &&
-    request.headers.get("X-Admin-Token") === token
-  );
 }
 
 function newId() {
   return crypto.randomUUID();
 }
 
+function normalizePhone(value) {
+  let phone = String(value || "").replace(/[\s()-]/g, "");
+
+  if (phone.startsWith("+98")) {
+    phone = "0" + phone.slice(3);
+  } else if (phone.startsWith("0098")) {
+    phone = "0" + phone.slice(4);
+  }
+
+  return phone;
+}
+
+function randomToken() {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return bytesToBase64(bytes)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(value) {
+  const binary = atob(value);
+  return Uint8Array.from(binary, c => c.charCodeAt(0));
+}
+
+async function sha256(value) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value)
+  );
+  return bytesToBase64(new Uint8Array(digest));
+}
+
+async function passwordHash(password, salt) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: 100000,
+      hash: "SHA-256"
+    },
+    key,
+    256
+  );
+
+  return bytesToBase64(new Uint8Array(bits));
+}
+
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await passwordHash(password, salt);
+
+  return {
+    salt: bytesToBase64(salt),
+    hash
+  };
+}
+
+async function verifyPassword(password, salt, expected) {
+  const actual = await passwordHash(
+    password,
+    base64ToBytes(salt)
+  );
+
+  return actual === expected;
+}
+
 async function ensureTables(db) {
   await db.batch([
-    db.prepare(`CREATE TABLE IF NOT EXISTS products (
+    db.prepare(`CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      price INTEGER NOT NULL CHECK(price > 0),
-      active INTEGER NOT NULL DEFAULT 1
-    )`),
-    db.prepare(`CREATE TABLE IF NOT EXISTS orders (
-      id TEXT PRIMARY KEY,
-      customer_name TEXT NOT NULL,
-      phone TEXT NOT NULL,
-      address TEXT NOT NULL,
-      postal_code TEXT,
-      items_json TEXT NOT NULL,
-      total INTEGER NOT NULL,
-      payment_reference TEXT,
-      status TEXT NOT NULL DEFAULT 'awaiting_payment',
+      phone TEXT NOT NULL UNIQUE,
+      password_salt TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
       created_at TEXT NOT NULL
+    )`),
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS sessions (
+      token_hash TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`),
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS listings (
+      id TEXT PRIMARY KEY,
+      seller_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      category TEXT NOT NULL,
+      price INTEGER NOT NULL DEFAULT 0,
+      city TEXT NOT NULL,
+      image_url TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`),
+
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_listings_status
+      ON listings(status, created_at)`),
+
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_listings_seller
+      ON listings(seller_id, status)`),
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS subscriptions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      plan TEXT NOT NULL,
+      starts_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL
+    )`),
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS subscription_requests (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      plan TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      payment_reference TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT NOT NULL,
+      reviewed_at TEXT
     )`)
   ]);
 }
 
 function validOrigin(request) {
   const origin = request.headers.get("Origin");
-
-  // درخواست مستقیم مرورگر بدون Origin مجاز نیست؛
-  // درخواست‌های سرور به سرور بدون Origin قابل قبول‌اند.
   return !origin || origin === ALLOWED_ORIGIN;
 }
 
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = url.pathname.replace(/\/+$/, "") || "/";
+function isAdmin(request, env) {
+  const expected = env.ADMIN_TOKEN;
+  const actual = request.headers.get("X-Admin-Token");
 
-    if (request.method === "OPTIONS") {
-      if (!validOrigin(request)) {
-        return response({ ok: false, error: "ORIGIN_NOT_ALLOWED" }, 403);
-      }
+  return Boolean(expected && actual && actual === expected);
+}
 
-      return new Response(null, {
-        status: 204,
-        headers: HEADERS
-      });
-    }
+async function getUser(request, env) {
+  const authorization = request.headers.get("Authorization") || "";
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
 
+  if (!match) return null;
+
+  const tokenHash = await sha256(match[1]);
+
+  const session = await env.DB.prepare(`
+    SELECT users.id, users.phone
+    FROM sessions
+    JOIN users ON users.id = sessions.user_id
+    WHERE sessions.token_hash = ?
+      AND sessions.expires_at > ?
+  `).bind(tokenHash, new Date().toISOString()).first();
+
+  return session || null;
+}
+
+async function createSession(db, userId) {
+  const token = randomToken();
+  const tokenHash = await sha256(token);
+  const now = new Date();
+  const expires = new Date(
+    now.getTime() + SESSION_DAYS * 86400000
+  );
+
+  await db.prepare(`
+    INSERT INTO sessions (
+      token_hash, user_id, expires_at, created_at
+    ) VALUES (?, ?, ?, ?)
+  `).bind(
+    tokenHash,
+    userId,
+    expires.toISOString(),
+    now.toISOString()
+  ).run();
+
+  return { token, expiresAt: expires.toISOString() };
+}
+
+async function getCurrentPlan(db, userId) {
+  const subscription = await db.prepare(`
+    SELECT plan, expires_at
+    FROM subscriptions
+    WHERE user_id = ?
+      AND status = 'active'
+      AND expires_at > ?
+    ORDER BY expires_at DESC
+    LIMIT 1
+  `).bind(userId, new Date().toISOString()).first();
+
+  if (subscription && PLANS[subscription.plan]) {
+    return {
+      id: subscription.plan,
+      ...PLANS[subscription.plan],
+      expiresAt: subscription.expires_at
+    };
+  }
+
+  return {
+    id: "free",
+    ...PLANS.free,
+    expiresAt: null
+  };
+}
+
+async function listingCount(db, userId) {
+  const row = await db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM listings
+    WHERE seller_id = ?
+      AND status IN ('pending', 'published')
+  `).bind(userId).first();
+
+  return Number(row?.count || 0);
+}
+
+async function handle(request, env) {
+  const url = new URL(request.url);
+  const path = url.pathname.replace(/\/+$/, "") || "/";
+  const method = request.method;
+
+  if (method === "OPTIONS") {
     if (!validOrigin(request)) {
       return response({ ok: false, error: "ORIGIN_NOT_ALLOWED" }, 403);
     }
 
+    return new Response(null, { status: 204, headers: headers() });
+  }
+
+  if (!validOrigin(request)) {
+    return response({ ok: false, error: "ORIGIN_NOT_ALLOWED" }, 403);
+  }
+
+  if (path === "/health" && method === "GET") {
+    return response({
+      ok: true,
+      service: "kalano-api",
+      databaseConfigured: Boolean(env.DB)
+    });
+  }
+
+  if (!env.DB) {
+    return response({
+      ok: false,
+      error: "DB_NOT_CONFIGURED"
+    }, 500);
+  }
+
+  await ensureTables(env.DB);
+  const db = env.DB;
+
+  if (path === "/api/plans" && method === "GET") {
+    return response({
+      ok: true,
+      plans: Object.entries(PLANS).map(([id, plan]) => ({
+        id,
+        ...plan,
+        durationDays: id === "free" ? 0 : 30
+      }))
+    });
+  }
+
+  if (path === "/api/payment-info" && method === "GET") {
+    return response({
+      ok: true,
+      method: "card_to_card",
+      cardHolder: env.CARD_HOLDER || "",
+      cardNumber: env.CARD_NUMBER || "",
+      paymentIsAutomatic: false
+    });
+  }
+
+  // ثبت‌نام
+  if (path === "/api/register" && method === "POST") {
+    let body;
     try {
-      if (request.method === "GET" && path === "/health") {
-        return response({
-          ok: true,
-          service: "kalano-api",
-          databaseConfigured: Boolean(env.DB)
-        });
-      }
+      body = await request.json();
+    } catch {
+      return response({ ok: false, error: "INVALID_JSON" }, 400);
+    }
 
-      if (!env.DB) {
-        return response({
-          ok: false,
-          error: "DB_NOT_CONFIGURED",
-          message: "اتصال D1 با نام DB تنظیم نشده است."
-        }, 500);
-      }
+    const phone = normalizePhone(body.phone);
+    const password = String(body.password || "");
 
-      await ensureTables(env.DB);
+    if (!/^09\d{9}$/.test(phone)) {
+      return response({ ok: false, error: "INVALID_PHONE" }, 400);
+    }
 
-      if (request.method === "GET" && path === "/api/payment-info") {
-        return response({
-          ok: true,
-          method: "card_to_card",
-          cardHolder: env.CARD_HOLDER || "",
-          cardNumber: env.CARD_NUMBER || "",
-          paymentIsAutomatic: false
-        });
-      }
-
-      // فهرست محصولات فعال
-      if (request.method === "GET" && path === "/api/products") {
-        const result = await env.DB.prepare(`
-          SELECT id, name, price
-          FROM products
-          WHERE active = 1
-          ORDER BY name
-          LIMIT 500
-        `).all();
-
-        return response({
-          ok: true,
-          products: result.results
-        });
-      }
-
-      // افزودن یا به‌روزرسانی محصول توسط مدیر
-      if (request.method === "POST" &&
-          path === "/api/admin/products") {
-        if (!isAdmin(request, env)) {
-          return response({
-            ok: false,
-            error: "UNAUTHORIZED"
-          }, 401);
-        }
-
-        let body;
-        try {
-          body = await request.json();
-        } catch {
-          return response({ ok: false, error: "INVALID_JSON" }, 400);
-        }
-
-        const name = String(body.name || "").trim();
-        const price = Number(body.price);
-        const id = String(body.id || newId()).trim();
-
-        if (!name || name.length > 200 ||
-            !Number.isSafeInteger(price) || price <= 0 ||
-            id.length > 100) {
-          return response({
-            ok: false,
-            error: "INVALID_PRODUCT"
-          }, 400);
-        }
-
-        await env.DB.prepare(`
-          INSERT INTO products (id, name, price, active)
-          VALUES (?, ?, ?, 1)
-          ON CONFLICT(id) DO UPDATE SET
-            name = excluded.name,
-            price = excluded.price,
-            active = 1
-        `).bind(id, name, price).run();
-
-        return response({ ok: true, id }, 201);
-      }
-
-      // غیرفعال کردن محصول توسط مدیر
-      if (request.method === "POST" &&
-          path === "/api/admin/products/deactivate") {
-        if (!isAdmin(request, env)) {
-          return response({ ok: false, error: "UNAUTHORIZED" }, 401);
-        }
-
-        const body = await request.json();
-        const id = String(body.id || "").trim();
-
-        if (!id) {
-          return response({ ok: false, error: "INVALID_PRODUCT_ID" }, 400);
-        }
-
-        const result = await env.DB.prepare(`
-          UPDATE products SET active = 0 WHERE id = ?
-        `).bind(id).run();
-
-        if (!result.meta.changes) {
-          return response({ ok: false, error: "PRODUCT_NOT_FOUND" }, 404);
-        }
-
-        return response({ ok: true });
-      }
-
-      // ثبت سفارش با قیمت محاسبه‌شده از دیتابیس
-      if (request.method === "POST" && path === "/api/orders") {
-        let body;
-        try {
-          body = await request.json();
-        } catch {
-          return response({ ok: false, error: "INVALID_JSON" }, 400);
-        }
-
-        const name = String(body.name || "").trim();
-        const phone = String(body.phone || "").trim();
-        const address = String(body.address || "").trim();
-        const postalCode = String(body.postalCode || "").trim();
-        const items = body.items;
-
-        if (!name || name.length > 120 ||
-            !/^[0-9+\-\s()]{8,30}$/.test(phone) ||
-            !address || address.length > 1000 ||
-            postalCode.length > 30) {
-          return response({
-            ok: false,
-            error: "INVALID_CUSTOMER_DETAILS"
-          }, 400);
-        }
-
-        if (!Array.isArray(items) ||
-            items.length < 1 || items.length > 50) {
-          return response({ ok: false, error: "INVALID_ITEMS" }, 400);
-        }
-
-        const quantities = new Map();
-
-        for (const item of items) {
-          const id = String(item?.id || "").trim();
-          const quantity = Number(item?.quantity);
-
-          if (!id || id.length > 100 ||
-              !Number.isSafeInteger(quantity) ||
-              quantity < 1 || quantity > 20) {
-            return response({ ok: false, error: "INVALID_ITEM" }, 400);
-          }
-
-          const nextQuantity = (quantities.get(id) || 0) + quantity;
-
-          if (nextQuantity > 20) {
-            return response({ ok: false, error: "QUANTITY_TOO_LARGE" }, 400);
-          }
-
-          quantities.set(id, nextQuantity);
-        }
-
-        const ids = [...quantities.keys()];
-        const placeholders = ids.map(() => "?").join(",");
-
-        const result = await env.DB.prepare(`
-          SELECT id, name, price
-          FROM products
-          WHERE active = 1 AND id IN (${placeholders})
-        `).bind(...ids).all();
-
-        if (result.results.length !== ids.length) {
-          return response({
-            ok: false,
-            error: "PRODUCT_NOT_FOUND_OR_INACTIVE"
-          }, 400);
-        }
-
-        let total = 0;
-        const finalItems = [];
-
-        for (const product of result.results) {
-          const quantity = quantities.get(product.id);
-          const lineTotal = product.price * quantity;
-
-          if (!Number.isSafeInteger(lineTotal) ||
-              !Number.isSafeInteger(total + lineTotal)) {
-            return response({ ok: false, error: "TOTAL_TOO_LARGE" }, 400);
-          }
-
-          total += lineTotal;
-
-          finalItems.push({
-            id: product.id,
-            name: product.name,
-            price: product.price,
-            quantity,
-            lineTotal
-          });
-        }
-
-        const id = newId();
-        const createdAt = new Date().toISOString();
-
-        await env.DB.prepare(`
-          INSERT INTO orders (
-            id, customer_name, phone, address, postal_code,
-            items_json, total, status, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'awaiting_payment', ?)
-        `).bind(
-          id,
-          name,
-          phone,
-          address,
-          postalCode,
-          JSON.stringify(finalItems),
-          total,
-          createdAt
-        ).run();
-
-        return response({
-          ok: true,
-          order: {
-            id,
-            items: finalItems,
-            total,
-            status: "awaiting_payment",
-            createdAt
-          },
-          payment: {
-            method: "card_to_card",
-            cardHolder: env.CARD_HOLDER || "",
-            cardNumber: env.CARD_NUMBER || "",
-            paymentIsAutomatic: false
-          },
-          message: "سفارش ثبت شد. پرداخت هنوز تأیید نشده است."
-        }, 201);
-      }
-
-      // ارسال کد پیگیری پرداخت؛ این کار به‌تنهایی اثبات پرداخت نیست.
-      const paymentMatch = path.match(
-        /^\/api\/orders\/([a-f0-9-]{36})\/payment-reference$/i
-      );
-
-      if (request.method === "POST" && paymentMatch) {
-        let body;
-        try {
-          body = await request.json();
-        } catch {
-          return response({ ok: false, error: "INVALID_JSON" }, 400);
-        }
-
-        const reference = String(body.reference || "").trim();
-
-        if (reference.length < 3 || reference.length > 100) {
-          return response({ ok: false, error: "INVALID_REFERENCE" }, 400);
-        }
-
-        const result = await env.DB.prepare(`
-          UPDATE orders
-          SET payment_reference = ?, status = 'payment_reported'
-          WHERE id = ? AND status = 'awaiting_payment'
-        `).bind(reference, paymentMatch[1]).run();
-
-        if (!result.meta.changes) {
-          return response({
-            ok: false,
-            error: "ORDER_NOT_FOUND_OR_ALREADY_REPORTED"
-          }, 404);
-        }
-
-        return response({
-          ok: true,
-          status: "payment_reported",
-          message: "گزارش دریافت شد؛ مدیر باید واریز را بررسی کند."
-        });
-      }
-
-      // مشاهده سفارش‌ها توسط مدیر
-      if (request.method === "GET" && path === "/api/admin/orders") {
-        if (!isAdmin(request, env)) {
-          return response({ ok: false, error: "UNAUTHORIZED" }, 401);
-        }
-
-        const result = await env.DB.prepare(`
-          SELECT id, customer_name, phone, address, postal_code,
-                 items_json, total, payment_reference, status, created_at
-          FROM orders
-          ORDER BY created_at DESC
-          LIMIT 100
-        `).all();
-
-        return response({ ok: true, orders: result.results });
-      }
-
-      // تغییر وضعیت سفارش توسط مدیر
-      const statusMatch = path.match(
-        /^\/api\/admin\/orders\/([a-f0-9-]{36})\/status$/i
-      );
-
-      if (request.method === "POST" && statusMatch) {
-        if (!isAdmin(request, env)) {
-          return response({ ok: false, error: "UNAUTHORIZED" }, 401);
-        }
-
-        let body;
-        try {
-          body = await request.json();
-        } catch {
-          return response({ ok: false, error: "INVALID_JSON" }, 400);
-        }
-
-        const status = String(body.status || "");
-        const allowed = [
-          "awaiting_payment",
-          "payment_reported",
-          "paid",
-          "processing",
-          "shipped",
-          "cancelled"
-        ];
-
-        if (!allowed.includes(status)) {
-          return response({ ok: false, error: "INVALID_STATUS" }, 400);
-        }
-
-        const order = await env.DB.prepare(`
-          SELECT status, payment_reference
-          FROM orders
-          WHERE id = ?
-        `).bind(statusMatch[1]).first();
-
-        if (!order) {
-          return response({ ok: false, error: "ORDER_NOT_FOUND" }, 404);
-        }
-
-        if (status === "paid" &&
-            (order.status !== "payment_reported" ||
-             !order.payment_reference)) {
-          return response({
-            ok: false,
-            error: "PAYMENT_REPORT_REQUIRED"
-          }, 409);
-        }
-
-        const result = await env.DB.prepare(`
-          UPDATE orders SET status = ? WHERE id = ?
-        `).bind(status, statusMatch[1]).run();
-
-        if (!result.meta.changes) {
-          return response({ ok: false, error: "ORDER_UPDATE_FAILED" }, 500);
-        }
-
-        return response({ ok: true, status });
-      }
-
+    if (password.length < 8 || password.length > 128) {
       return response({
         ok: false,
-        error: "NOT_FOUND"
-      }, 404);
+        error: "PASSWORD_LENGTH",
+        message: "رمز عبور باید حداقل ۸ نویسه باشد."
+      }, 400);
+    }
 
+    const existing = await db.prepare(
+      "SELECT id FROM users WHERE phone = ?"
+    ).bind(phone).first();
+
+    if (existing) {
+      return response({ ok: false, error: "PHONE_EXISTS" }, 409);
+    }
+
+    const credentials = await hashPassword(password);
+    const userId = newId();
+
+    await db.prepare(`
+      INSERT INTO users (
+        id, phone, password_salt, password_hash, created_at
+      ) VALUES (?, ?, ?, ?, ?)
+    `).bind(
+      userId,
+      phone,
+      credentials.salt,
+      credentials.hash,
+      new Date().toISOString()
+    ).run();
+
+    const session = await createSession(db, userId);
+
+    return response({
+      ok: true,
+      token: session.token,
+      expiresAt: session.expiresAt,
+      user: { id: userId, phone },
+      message: "حساب ساخته شد."
+    }, 201);
+  }
+
+  // ورود
+  if (path === "/api/login" && method === "POST") {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return response({ ok: false, error: "INVALID_JSON" }, 400);
+    }
+
+    const phone = normalizePhone(body.phone);
+    const password = String(body.password || "");
+
+    const user = await db.prepare(`
+      SELECT id, phone, password_salt, password_hash
+      FROM users WHERE phone = ?
+    `).bind(phone).first();
+
+    if (
+      !user ||
+      !(await verifyPassword(
+        password,
+        user.password_salt,
+        user.password_hash
+      ))
+    ) {
+      return response({
+        ok: false,
+        error: "INVALID_CREDENTIALS"
+      }, 401);
+    }
+
+    const session = await createSession(db, user.id);
+
+    return response({
+      ok: true,
+      token: session.token,
+      expiresAt: session.expiresAt,
+      user: { id: user.id, phone: user.phone }
+    });
+  }
+
+  // خروج
+  if (path === "/api/logout" && method === "POST") {
+    const authorization = request.headers.get("Authorization") || "";
+    const match = authorization.match(/^Bearer\s+(.+)$/i);
+
+    if (match) {
+      await db.prepare(
+        "DELETE FROM sessions WHERE token_hash = ?"
+      ).bind(await sha256(match[1])).run();
+    }
+
+    return response({ ok: true });
+  }
+
+  // حساب کاربر
+  if (path === "/api/me" && method === "GET") {
+    const user = await getUser(request, env);
+    if (!user) return response({ ok: false, error: "UNAUTHORIZED" }, 401);
+
+    const plan = await getCurrentPlan(db, user.id);
+    const count = await listingCount(db, user.id);
+
+    return response({
+      ok: true,
+      user,
+      plan,
+      listingCount: count,
+      remainingListings: Math.max(0, plan.limit - count)
+    });
+  }
+
+  // فهرست آگهی‌های تأییدشده
+  if (path === "/api/listings" && method === "GET") {
+    const conditions = ["status = 'published'"];
+    const params = [];
+
+    const search = (url.searchParams.get("q") || "").trim().slice(0, 100);
+    const category = (url.searchParams.get("category") || "").trim().slice(0, 80);
+    const city = (url.searchParams.get("city") || "").trim().slice(0, 80);
+
+    if (search) {
+      conditions.push("(title LIKE ? OR description LIKE ?)");
+      params.push(`%${search}%`, `%${search}%`);
+    }
+
+    if (category) {
+      conditions.push("category = ?");
+      params.push(category);
+    }
+
+    if (city) {
+      conditions.push("city LIKE ?");
+      params.push(`%${city}%`);
+    }
+
+    const rows = await db.prepare(`
+      SELECT id, seller_id, title, description, category,
+             price, city, image_url, created_at
+      FROM listings
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY created_at DESC
+      LIMIT 100
+    `).bind(...params).all();
+
+    return response({ ok: true, listings: rows.results });
+  }
+
+  // ثبت آگهی
+  if (path === "/api/listings" && method === "POST") {
+    const user = await getUser(request, env);
+    if (!user) return response({ ok: false, error: "UNAUTHORIZED" }, 401);
+
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return response({ ok: false, error: "INVALID_JSON" }, 400);
+    }
+
+    const title = String(body.title || "").trim();
+    const description = String(body.description || "").trim();
+    const category = String(body.category || "").trim();
+    const city = String(body.city || "").trim();
+    const imageUrl = String(body.imageUrl || "").trim();
+    const price = Number(body.price || 0);
+
+    if (
+      title.length < 3 || title.length > 150 ||
+      description.length < 5 || description.length > 5000 ||
+      category.length < 2 || category.length > 80 ||
+      city.length < 2 || city.length > 80 ||
+      !Number.isSafeInteger(price) || price < 0 ||
+      imageUrl.length > 1000 ||
+      (imageUrl && !/^https:\/\/\S+$/i.test(imageUrl))
+    ) {
+      return response({ ok: false, error: "INVALID_LISTING" }, 400);
+    }
+
+    const plan = await getCurrentPlan(db, user.id);
+    const count = await listingCount(db, user.id);
+
+    if (count >= plan.limit) {
+      return response({
+        ok: false,
+        error: "PLAN_LIMIT_REACHED",
+        plan: plan.id,
+        limit: plan.limit,
+        message: "سقف آگهی پلن شما پر شده است."
+      }, 403);
+    }
+
+    const id = newId();
+    const now = new Date().toISOString();
+
+    await db.prepare(`
+      INSERT INTO listings (
+        id, seller_id, title, description, category, price,
+        city, image_url, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+    `).bind(
+      id, user.id, title, description, category, price,
+      city, imageUrl, now, now
+    ).run();
+
+    return response({
+      ok: true,
+      id,
+      status: "pending",
+      message: "آگهی ثبت شد و پس از تأیید مدیر نمایش داده می‌شود."
+    }, 201);
+  }
+
+  // آگهی‌های خود فروشنده
+  if (path === "/api/my-listings" && method === "GET") {
+    const user = await getUser(request, env);
+    if (!user) return response({ ok: false, error: "UNAUTHORIZED" }, 401);
+
+    const rows = await db.prepare(`
+      SELECT id, title, description, category, price, city,
+             image_url, status, created_at, updated_at
+      FROM listings
+      WHERE seller_id = ?
+      ORDER BY created_at DESC
+      LIMIT 200
+    `).bind(user.id).all();
+
+    return response({ ok: true, listings: rows.results });
+  }
+
+  // ویرایش آگهی متعلق به خود فروشنده
+  const editMatch = path.match(/^\/api\/listings\/([a-f0-9-]{36})$/i);
+
+  if (editMatch && method === "POST") {
+    const user = await getUser(request, env);
+    if (!user) return response({ ok: false, error: "UNAUTHORIZED" }, 401);
+
+    const existing = await db.prepare(`
+      SELECT id FROM listings WHERE id = ? AND seller_id = ?
+    `).bind(editMatch[1], user.id).first();
+
+    if (!existing) {
+      return response({ ok: false, error: "LISTING_NOT_FOUND" }, 404);
+    }
+
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return response({ ok: false, error: "INVALID_JSON" }, 400);
+    }
+
+    const title = String(body.title || "").trim();
+    const description = String(body.description || "").trim();
+    const category = String(body.category || "").trim();
+    const city = String(body.city || "").trim();
+    const imageUrl = String(body.imageUrl || "").trim();
+    const price = Number(body.price || 0);
+
+    if (
+      title.length < 3 || title.length > 150 ||
+      description.length < 5 || description.length > 5000 ||
+      !category || category.length > 80 ||
+      !city || city.length > 80 ||
+      !Number.isSafeInteger(price) || price < 0 ||
+      imageUrl.length > 1000 ||
+      (imageUrl && !/^https:\/\/\S+$/i.test(imageUrl))
+    ) {
+      return response({ ok: false, error: "INVALID_LISTING" }, 400);
+    }
+
+    await db.prepare(`
+      UPDATE listings
+      SET title = ?, description = ?, category = ?, price = ?,
+          city = ?, image_url = ?, status = 'pending', updated_at = ?
+      WHERE id = ? AND seller_id = ?
+    `).bind(
+      title, description, category, price, city, imageUrl,
+      new Date().toISOString(), editMatch[1], user.id
+    ).run();
+
+    return response({
+      ok: true,
+      status: "pending",
+      message: "تغییرات ذخیره شد و برای نمایش دوباره نیاز به تأیید دارد."
+    });
+  }
+
+  // غیرفعال‌کردن آگهی خود فروشنده
+  const deleteMatch = path.match(
+    /^\/api\/listings\/([a-f0-9-]{36})\/delete$/i
+  );
+
+  if (deleteMatch && method === "POST") {
+    const user = await getUser(request, env);
+    if (!user) return response({ ok: false, error: "UNAUTHORIZED" }, 401);
+
+    const result = await db.prepare(`
+      UPDATE listings
+      SET status = 'disabled', updated_at = ?
+      WHERE id = ? AND seller_id = ?
+    `).bind(
+      new Date().toISOString(), deleteMatch[1], user.id
+    ).run();
+
+    if (!result.meta.changes) {
+      return response({ ok: false, error: "LISTING_NOT_FOUND" }, 404);
+    }
+
+    return response({ ok: true });
+  }
+
+  // درخواست اشتراک پولی
+  if (path === "/api/subscriptions/request" && method === "POST") {
+    const user = await getUser(request, env);
+    if (!user) return response({ ok: false, error: "UNAUTHORIZED" }, 401);
+
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return response({ ok: false, error: "INVALID_JSON" }, 400);
+    }
+
+    const planId = String(body.plan || "");
+    const reference = String(body.reference || "").trim();
+    const plan = PLANS[planId];
+
+    if (!plan || planId === "free") {
+      return response({ ok: false, error: "INVALID_PLAN" }, 400);
+    }
+
+    if (reference.length < 3 || reference.length > 100) {
+      return response({ ok: false, error: "INVALID_REFERENCE" }, 400);
+    }
+
+    const pending = await db.prepare(`
+      SELECT id FROM subscription_requests
+      WHERE user_id = ? AND status = 'pending'
+      LIMIT 1
+    `).bind(user.id).first();
+
+    if (pending) {
+      return response({
+        ok: false,
+        error: "PENDING_REQUEST_EXISTS"
+      }, 409);
+    }
+
+    const id = newId();
+
+    await db.prepare(`
+      INSERT INTO subscription_requests (
+        id, user_id, plan, amount, payment_reference,
+        status, created_at
+      ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+    `).bind(
+      id, user.id, planId, plan.price, reference,
+      new Date().toISOString()
+    ).run();
+
+    return response({
+      ok: true,
+      requestId: id,
+      status: "pending",
+      amount: plan.price,
+      message: "درخواست ثبت شد؛ فعال‌سازی پس از بررسی مدیر انجام می‌شود."
+    }, 201);
+  }
+
+  // وضعیت درخواست‌های اشتراک خود کاربر
+  if (path === "/api/subscriptions/mine" && method === "GET") {
+    const user = await getUser(request, env);
+    if (!user) return response({ ok: false, error: "UNAUTHORIZED" }, 401);
+
+    const rows = await db.prepare(`
+      SELECT id, plan, amount, payment_reference, status,
+             created_at, reviewed_at
+      FROM subscription_requests
+      WHERE user_id = ?
+      ORDER BY created_at DESC
+      LIMIT 50
+    `).bind(user.id).all();
+
+    const plan = await getCurrentPlan(db, user.id);
+
+    return response({
+      ok: true,
+      requests: rows.results,
+      activePlan: plan
+    });
+  }
+
+  // پنل مدیر: درخواست‌های اشتراک
+  if (path === "/api/admin/subscriptions" && method === "GET") {
+    if (!isAdmin(request, env)) {
+      return response({ ok: false, error: "UNAUTHORIZED" }, 401);
+    }
+
+    const rows = await db.prepare(`
+      SELECT r.id, r.user_id, u.phone, r.plan, r.amount,
+             r.payment_reference, r.status, r.created_at
+      FROM subscription_requests r
+      JOIN users u ON u.id = r.user_id
+      ORDER BY r.created_at DESC
+      LIMIT 200
+    `).all();
+
+    return response({ ok: true, requests: rows.results });
+  }
+
+  // تأیید یا رد اشتراک توسط مدیر
+  const reviewSubscription = path.match(
+    /^\/api\/admin\/subscriptions\/([a-f0-9-]{36})\/review$/i
+  );
+
+  if (reviewSubscription && method === "POST") {
+    if (!isAdmin(request, env)) {
+      return response({ ok: false, error: "UNAUTHORIZED" }, 401);
+    }
+
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return response({ ok: false, error: "INVALID_JSON" }, 400);
+    }
+
+    const decision = String(body.status || "");
+
+    if (!["approved", "rejected"].includes(decision)) {
+      return response({ ok: false, error: "INVALID_STATUS" }, 400);
+    }
+
+    const item = await db.prepare(`
+      SELECT id, user_id, plan, status
+      FROM subscription_requests WHERE id = ?
+    `).bind(reviewSubscription[1]).first();
+
+    if (!item) {
+      return response({ ok: false, error: "REQUEST_NOT_FOUND" }, 404);
+    }
+
+    if (item.status !== "pending") {
+      return response({ ok: false, error: "ALREADY_REVIEWED" }, 409);
+    }
+
+    const now = new Date().toISOString();
+
+    if (decision === "approved") {
+      if (!PLANS[item.plan] || item.plan === "free") {
+        return response({ ok: false, error: "INVALID_PLAN" }, 400);
+      }
+
+      const current = await db.prepare(`
+        SELECT expires_at FROM subscriptions
+        WHERE user_id = ? AND status = 'active' AND expires_at > ?
+        ORDER BY expires_at DESC LIMIT 1
+      `).bind(item.user_id, now).first();
+
+      const startDate = current
+        ? new Date(current.expires_at)
+        : new Date(now);
+
+      const expiry = new Date(
+        startDate.getTime() + 30 * 86400000
+      );
+
+      await db.batch([
+        db.prepare(`
+          UPDATE subscription_requests
+          SET status = 'approved', reviewed_at = ?
+          WHERE id = ? AND status = 'pending'
+        `).bind(now, item.id),
+
+        db.prepare(`
+          UPDATE subscriptions SET status = 'expired'
+          WHERE user_id = ? AND status = 'active'
+        `).bind(item.user_id),
+
+        db.prepare(`
+          INSERT INTO subscriptions (
+            id, user_id, plan, starts_at, expires_at, status, created_at
+          ) VALUES (?, ?, ?, ?, ?, 'active', ?)
+        `).bind(
+          newId(), item.user_id, item.plan,
+          startDate.toISOString(), expiry.toISOString(), now
+        )
+      ]);
+    } else {
+      await db.prepare(`
+        UPDATE subscription_requests
+        SET status = 'rejected', reviewed_at = ?
+        WHERE id = ? AND status = 'pending'
+      `).bind(now, item.id).run();
+    }
+
+    return response({
+      ok: true,
+      status: decision,
+      message: decision === "approved"
+        ? "اشتراک فعال شد."
+        : "درخواست رد شد."
+    });
+  }
+
+  // پنل مدیر: مشاهده آگهی‌ها
+  if (path === "/api/admin/listings" && method === "GET") {
+    if (!isAdmin(request, env)) {
+      return response({ ok: false, error: "UNAUTHORIZED" }, 401);
+    }
+
+    const rows = await db.prepare(`
+      SELECT l.*, u.phone AS seller_phone
+      FROM listings l
+      JOIN users u ON u.id = l.seller_id
+      ORDER BY l.created_at DESC
+      LIMIT 200
+    `).all();
+
+    return response({ ok: true, listings: rows.results });
+  }
+
+  // تأیید یا رد آگهی
+  const reviewListing = path.match(
+    /^\/api\/admin\/listings\/([a-f0-9-]{36})\/review$/i
+  );
+
+  if (reviewListing && method === "POST") {
+    if (!isAdmin(request, env)) {
+      return response({ ok: false, error: "UNAUTHORIZED" }, 401);
+    }
+
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return response({ ok: false, error: "INVALID_JSON" }, 400);
+    }
+
+    const status = String(body.status || "");
+
+    if (!["published", "rejected", "disabled"].includes(status)) {
+      return response({ ok: false, error: "INVALID_STATUS" }, 400);
+    }
+
+    const result = await db.prepare(`
+      UPDATE listings
+      SET status = ?, updated_at = ?
+      WHERE id = ?
+    `).bind(
+      status, new Date().toISOString(), reviewListing[1]
+    ).run();
+
+    if (!result.meta.changes) {
+      return response({ ok: false, error: "LISTING_NOT_FOUND" }, 404);
+    }
+
+    return response({ ok: true, status });
+  }
+
+  return response({ ok: false, error: "NOT_FOUND" }, 404);
+}
+
+export default {
+  async fetch(request, env) {
+    try {
+      return await handle(request, env);
     } catch (error) {
-      // جزئیات خطا به کاربر عمومی نمایش داده نمی‌شود.
       console.error("Kalano API error:", error);
-
       return response({
         ok: false,
         error: "INTERNAL_ERROR",
